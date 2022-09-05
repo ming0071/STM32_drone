@@ -33,8 +33,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 // AK8963
-#define AK8963_ADDRESS 0x0C << 1 // i2c read is align left (0X1A)
-#define AK8963_WHO_AM_I 0x00     // should return 0x48
+#define AK8963_ADDRESS 0x0C << 1
+#define AK8963_WHO_AM_I 0x00 // should return 0x48
 #define AK8963_INFO 0x01
 #define AK8963_ST1 0x02 // data ready status bit 0
 #define AK8963_XOUT_L 0x03
@@ -44,8 +44,7 @@
 #define AK8963_ZOUT_L 0x07
 #define AK8963_ZOUT_H 0x08
 #define AK8963_ST2 0x09
-#define AK8963_CNTL1 0x0A  // Power down (0000), single-measurement (0001), self-test (1000)
-                           //                    and Fuse ROM modes (1111) on bits 3:0
+#define AK8963_CNTL1 0x0A  // Power down (0000), single-measurement (0001), self-test (1000) and Fuse ROM (1111) modes on bits 3:0
 #define AK8963_ASTC 0x0C   // Self test control
 #define AK8963_I2CDIS 0x0F // I2C disable
 #define AK8963_ASAX 0x10   // Fuse ROM x-axis sensitivity adjustment value
@@ -80,12 +79,39 @@
 #define USER_CTRL 0x6A
 #define PWR_MGMT_1 0x6B
 #define PWR_MGMT_2 0x6C
-#define MPU9250_ADDRESS 0x68 << 1 // i2c read is align left (0xD0)
-#define WHO_AM_I_MPU9250 0x75     // Should return 0x71
+#define MPU9250_ADDRESS 0x68 << 1
+#define WHO_AM_I_MPU9250 0x75 // Should return 0x71
 
 // variables
 #define DEG2RAD 0.017453293f
 #define RAD2DEG 57.29578f
+
+short ACCELX;
+short ACCELY;
+short ACCELZ;
+short GYROX;
+short GYROY;
+short GYROZ;
+short MagX;
+short MagY;
+short MagZ;
+
+float Kp = 2.0f; /*比例增益*/
+float Ki = 0.1f; /*积分增益*/
+float exInt = 0.0f;
+float eyInt = 0.0f;
+float ezInt = 0.0f; /*积分误差累计*/
+
+static float q0 = 1.0f; /*四元数*/
+static float q1 = 0.0f;
+static float q2 = 0.0f;
+static float q3 = 0.0f;
+volatile uint32_t last_update, now_update;
+int yaw;
+int pitch;
+int roll;
+
+float ASA[3] = {0}; // ASA[0] = ASAX , ASA[1] = ASAY , ASA[2] = ASAZ
 
 struct Axisf
 {
@@ -93,7 +119,6 @@ struct Axisf
     float y;
     float z;
 };
-
 struct MPU9250_t
 {
     struct Axisf gyro;
@@ -113,18 +138,7 @@ struct MPU9250_t mpu9250;
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
-short TEMP;
-short ACCELX;
-short ACCELY;
-short ACCELZ;
-short GYROX;
-short GYROY;
-short GYROZ;
-short MagX;
-short MagY;
-short MagZ;
 
-float ASA[3] = {0}; // ASA[0] = ASAX , ASA[1] = ASAY , ASA[2] = ASAZ
 /* USER CODE BEGIN PV */
 
 const uint16_t i2c_timeoutB = 100;
@@ -138,8 +152,11 @@ static void MX_I2C1_Init(void);
 
 // myset
 void MPU9250_Init(float ASA[3]);
-void GetBiasData();
+void GetGyroBiasData();
+void GetAccBiasData();
+void GetMagBiasData();
 void GetIMUData(float ASA[3]);
+void imuUpdate();
 
 /* USER CODE BEGIN PFP */
 
@@ -204,10 +221,12 @@ int main(void)
         /* USER CODE END WHILE */
         /* USER CODE BEGIN 3 */
 
-        // GetBiasData();
+        // GetGyroBiasData();
+        // GetAccBiasData();
+        // GetMagBiasData();
         GetIMUData(ASA);
-        HAL_GPIO_TogglePin(GPIOE, GPIO_PIN_5);
-        HAL_Delay(500);
+        imuUpdate();
+        HAL_Delay(20);
     }
     /* USER CODE END 3 */
 }
@@ -321,7 +340,6 @@ void MPU9250_Init(float ASA[3])
     uint8_t readData;
     uint8_t writeData;
     unsigned char pdata;
-    uint8_t Ran;
 
     // Reset MPU
     pdata = 0x80;
@@ -337,16 +355,16 @@ void MPU9250_Init(float ASA[3])
     // Actually we don't need this step cause the reset value of the register 106 is 0x00
     writeData = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, USER_CTRL, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10); // wait for Mag setting
+    HAL_Delay(12); // wait for Mag setting
 
     // enable Mag bypass
     writeData = 0x02;
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, INT_PIN_CFG, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10); // wait for Mag setting
+    HAL_Delay(12); // wait for Mag setting
 
     // read AK8963 WHOAMI
     HAL_I2C_Mem_Read(&hi2c1, AK8963_ADDRESS, AK8963_WHO_AM_I, 1, &readData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
     printf("MAG WHO AM I is (Must return 72): %d\r\n\n", readData);
     printf("------------------------------------------------\r\n");
 
@@ -363,14 +381,14 @@ void MPU9250_Init(float ASA[3])
     // ACC
     pdata = 01 << 3; // Accel Full Scale Select ±4g (01)
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, ACCEL_CONFIG, 1, &pdata, 1, i2c_timeoutB);
-    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, ACCEL_CONFIG, 1, &Ran, 1, i2c_timeoutB);
-    printf("ACCEL meansure range : %d\r\n", Ran);
+    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, ACCEL_CONFIG, 1, &readData, 1, i2c_timeoutB);
+    printf("ACCEL meansure range : %d\r\n", readData);
 
     // GYRO
     pdata = 01 << 3; // Gyro Full Scale Select +500dps (01)
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, GYRO_CONFIG, 1, &pdata, 1, i2c_timeoutB);
-    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_CONFIG, 1, &Ran, 1, i2c_timeoutB);
-    printf("GYRO meansure range : %d\r\n", Ran);
+    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_CONFIG, 1, &readData, 1, i2c_timeoutB);
+    printf("GYRO meansure range : %d\r\n", readData);
 
     // Set gyro sample rate to 1 kHz
     pdata = 0x00;
@@ -396,12 +414,12 @@ void MPU9250_Init(float ASA[3])
     // Power down magnetometer
     writeData = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
 
     // Enter Fuse ROM access mode
     writeData = 0x1F;
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
 
     // Read the x-, y-, and z-axis calibration values
     uint8_t rawMagCalData[3];
@@ -413,45 +431,35 @@ void MPU9250_Init(float ASA[3])
     printf("Mag cal off X: %f\r\n", ASA[0]); // ASA[0] = ASAX
     printf("Mag cal off Y: %f\r\n", ASA[1]); // ASA[1] = ASAY
     printf("Mag cal off Z: %f\r\n", ASA[2]); // ASA[2] = ASAZ
-    HAL_Delay(10);
+    HAL_Delay(12);
 
     // Power down magnetometer
     writeData = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
 
     // Set magnetometer data resolution and sample ODR
     // set the Magnetometer to continuous mode 2（100Hz) and 16-bit output
     writeData = 0x16;
     printf("writeData: %x\r\n", writeData);
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
 
     printf("------------------------------------------------\r\n");
 }
-void GetBiasData()
+void GetGyroBiasData()
 {
-#define test_times 150000
+#define test_times 2
 
-    uint8_t rawACCELData[6] = {0};
-    uint8_t rawGYROData[6] = {0};
     int i = 0;
-
-    int32_t sumacc[3] = {0};
+    short avergyro[3] = {0};
     int32_t sumgyro[3] = {0};
+    uint8_t rawGYROData[6] = {0};
 
     printf("test times %d (about 1 min) \n\n", test_times);
+
     for (i = 0; i < test_times; i++)
     {
-        // Read ACCEL data.  Actually we don't need
-        HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, ACCEL_XOUT_H, 1, &rawACCELData[0], 6, i2c_timeoutB);
-        ACCELX = (rawACCELData[0] << 8) | rawACCELData[1];
-        ACCELY = (rawACCELData[2] << 8) | rawACCELData[3];
-        ACCELZ = (rawACCELData[4] << 8) | rawACCELData[5];
-        sumacc[0] += ACCELX;
-        sumacc[1] += ACCELY;
-        sumacc[2] += ACCELZ;
-
         // Read GYRO data
         HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_XOUT_H, 1, rawGYROData, 6, i2c_timeoutB);
         GYROX = (rawGYROData[0] << 8) | rawGYROData[1];
@@ -462,13 +470,7 @@ void GetBiasData()
         sumgyro[1] += GYROY;
         sumgyro[2] += GYROZ;
     }
-    short averacc[3] = {0};
-    short avergyro[3] = {0};
-    for (i = 0; i < 3; i++)
-    {
-        averacc[i] = (short)(sumacc[i] / test_times);
-        printf("acc %d = %d\r\n", i, averacc[i]);
-    }
+
     for (i = 0; i < 3; i++)
     {
         avergyro[i] = (short)(sumgyro[i] / test_times);
@@ -476,64 +478,24 @@ void GetBiasData()
     }
     printf("-------------------------------------------\n");
 }
-void GetIMUData(float ASA[3])
+void GetAccBiasData()
 {
-    static short mag_count = 0;
-    // Read ACCEL----------------------------------------------------------------------------------
-    // Read ACCEL data
-    uint8_t rawACCELData[6];
+    uint8_t rawACCELData[6] = {0};
+
+    // Read ACCEL data.  Actually we don't need do this
     HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, ACCEL_XOUT_H, 1, &rawACCELData[0], 6, i2c_timeoutB);
     ACCELX = (rawACCELData[0] << 8) | rawACCELData[1];
     ACCELY = (rawACCELData[2] << 8) | rawACCELData[3];
     ACCELZ = (rawACCELData[4] << 8) | rawACCELData[5];
 
-    // transfer to real unit(accel)
-    float tfa = (float)(4 * 9.81 / 32768.0);
-    mpu9250.acc.x = (float)ACCELX * tfa;
-    mpu9250.acc.y = (float)ACCELY * tfa;
-    mpu9250.acc.z = (float)ACCELZ * tfa;
-
-    printf("Accelerometer :\r\n");
-    printf("data AX: %d\r\n", ACCELX);
-    printf("ACCEL X: %.4f m/s^2\r\n", mpu9250.acc.x);
-    printf("data AY: %d\r\n", ACCELY);
-    printf("ACCEL Y: %.4f m/s^2\r\n", mpu9250.acc.y);
-    printf("data AZ: %d\r\n", ACCELZ);
-    printf("ACCEL Z: %.4f m/s^2\r\n\n", mpu9250.acc.z);
-
-    // Read GYRO-----------------------------------------------------------------------------------
-    // Read GYRO data
-    uint8_t rawGYROData[6] = {0};
-
-    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_XOUT_H, 1, rawGYROData, 6, i2c_timeoutB);
-    GYROX = ((rawGYROData[0] << 8) | rawGYROData[1]) - (-106); // bias Corrected
-    GYROY = ((rawGYROData[2] << 8) | rawGYROData[3]) - 36;     // bias Corrected
-    GYROZ = ((rawGYROData[4] << 8) | rawGYROData[5]) - 24;     // bias Corrected
-
-    // transfer to real unit(gyro)
-    float tfg = (float)(500.0 / 32768.0);
-
-    mpu9250.gyro.x = (float)GYROX * tfg;
-    mpu9250.gyro.y = (float)GYROY * tfg;
-    mpu9250.gyro.z = (float)GYROZ * tfg;
-    mpu9250.gyro.x *= DEG2RAD;
-    mpu9250.gyro.y *= DEG2RAD;
-    mpu9250.gyro.z *= DEG2RAD;
-
-    printf("Gyroscope(Bias Corrected) :\r\n");
-    printf("data GX: %d\r\n", GYROX);
-    printf("GYRO X: %.4f rad/s\r\n", mpu9250.gyro.x);
-    printf("data GY: %d\r\n", GYROY);
-    printf("GYRO Y: %.4f rad/s\r\n", mpu9250.gyro.y);
-    printf("data GZ: %d\r\n", GYROZ);
-    printf("GYRO Z: %.4f rad/s\r\n\n", mpu9250.gyro.z);
-
-    mag_count++;
+    printf("%d,%d,%d\r\n", ACCELX, ACCELY, ACCELZ);
+}
+void GetMagBiasData()
+{
     uint8_t readData;
 
-    // Read MAG-----------------------------------------------------------------------------------
     HAL_I2C_Mem_Read(&hi2c1, AK8963_ADDRESS, AK8963_ST1, 1, &readData, 1, i2c_timeoutB);
-    HAL_Delay(10);
+    HAL_Delay(12);
     if ((readData & 0x01) == 0x01) // check Data ready (DRDY is 1)
     {
         // Read Mag data
@@ -547,22 +509,10 @@ void GetIMUData(float ASA[3])
             MagY = (rawMagData[3] << 8) | rawMagData[2];
             MagZ = (rawMagData[5] << 8) | rawMagData[4];
 
-            // Print to Com port via STLINK
-            mpu9250.mag.x = (float)MagY * ASA[1] * (4912.0 / 32760.0);  // ASA[1] = ASAY
-            mpu9250.mag.y = (float)MagX * ASA[0] * (4912.0 / 32760.0);  // ASA[0] = ASAX
-            mpu9250.mag.z = (float)-MagZ * ASA[2] * (4912.0 / 32760.0); // ASA[2] = ASAZ
+            printf("%d,%d,%d\r\n", MagX, MagY, MagZ);
 
-            printf("Magnetometer(Direction Corrected) :\r\n");
-            printf("data MX: %d\r\n", MagY);
-            printf("Mag X: %.4f µT\r\n", mpu9250.mag.x);
-            printf("data MY: %d\r\n", MagX);
-            printf("Mag Y: %.4f µT\r\n", mpu9250.mag.y);
-            printf("data MZ: %d\r\n", -MagZ);
-            printf("Mag Z: %.4f µT\r\n\n", mpu9250.mag.z);
-            printf("------------------------------------------------\r\n");
-
-            mag_count = 0; // magnetometer can't read too often
-            HAL_Delay(100);
+            // mag_count = 0; // magnetometer can't read too often , 2rd method
+            HAL_Delay(12); // at 100 Hz ODR, new mag data is available every 10 ms
         }
     }
     else
@@ -570,6 +520,221 @@ void GetIMUData(float ASA[3])
         printf("No Data? \r\n");
         printf("------------------------------------------------\r\n");
     }
+}
+void GetIMUData(float ASA[3])
+{
+#define print_flag 0 // 0-> no work , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
+                     //             , 4 ->printf all data
+
+    static short mag_count = 0;
+    // Read ACCEL----------------------------------------------------------------------------------
+    // Read ACCEL data
+    uint8_t rawACCELData[6];
+    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, ACCEL_XOUT_H, 1, &rawACCELData[0], 6, i2c_timeoutB);
+    ACCELX = (rawACCELData[0] << 8) | rawACCELData[1];
+    ACCELY = (rawACCELData[2] << 8) | rawACCELData[3];
+    ACCELZ = (rawACCELData[4] << 8) | rawACCELData[5];
+
+    // transfer to real unit(accel)
+    float tfa = (float)(4 * 9.80665 / 32768.0);
+    mpu9250.acc.x = (float)ACCELX * tfa;
+    mpu9250.acc.y = (float)ACCELY * tfa;
+    mpu9250.acc.z = (float)ACCELZ * tfa;
+
+    if (print_flag == 1 || print_flag == 4)
+    {
+        printf("Accelerometer :\r\n");
+        printf("data AX: %d\r\n", ACCELX);
+        printf("ACCEL X: %.2f m/s^2\r\n", mpu9250.acc.x);
+        printf("data AY: %d\r\n", ACCELY);
+        printf("ACCEL Y: %.2f m/s^2\r\n", mpu9250.acc.y);
+        printf("data AZ: %d\r\n", ACCELZ);
+        printf("ACCEL Z: %.2f m/s^2\r\n\n", mpu9250.acc.z);
+    }
+
+    // Read GYRO-----------------------------------------------------------------------------------
+    // Read GYRO data
+    uint8_t rawGYROData[6] = {0};
+
+    HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_XOUT_H, 1, rawGYROData, 6, i2c_timeoutB);
+    GYROX = ((rawGYROData[0] << 8) | rawGYROData[1]) - (-106); // bias Corrected
+    GYROY = ((rawGYROData[2] << 8) | rawGYROData[3]) - 36;     // bias Corrected
+    GYROZ = ((rawGYROData[4] << 8) | rawGYROData[5]) - 24;     // bias Corrected
+    // 500  dps : x = -106 , y = 36 , z = 24
+    // 2000 dps : x = -24 , y = 2529 , z = 5
+
+    // transfer to real unit(gyro)
+    float tfg = (float)(500.0 / 32768.0);
+
+    mpu9250.gyro.x = (float)GYROX * tfg;
+    mpu9250.gyro.y = (float)GYROY * tfg;
+    mpu9250.gyro.z = (float)GYROZ * tfg;
+    mpu9250.gyro.x *= DEG2RAD;
+    mpu9250.gyro.y *= DEG2RAD;
+    mpu9250.gyro.z *= DEG2RAD;
+
+    if (print_flag == 2 || print_flag == 4)
+    {
+        printf("Gyroscope(Bias Corrected) :\r\n");
+        printf("data GX: %d\r\n", GYROX);
+        printf("GYRO X: %.4f rad/s\r\n", mpu9250.gyro.x);
+        printf("data GY: %d\r\n", GYROY);
+        printf("GYRO Y: %.4f rad/s\r\n", mpu9250.gyro.y);
+        printf("data GZ: %d\r\n", GYROZ);
+        printf("GYRO Z: %.4f rad/s\r\n\n", mpu9250.gyro.z);
+    }
+
+    mag_count++;
+    uint8_t readData;
+
+    // Read MAG-----------------------------------------------------------------------------------
+
+    HAL_I2C_Mem_Read(&hi2c1, AK8963_ADDRESS, AK8963_ST1, 1, &readData, 1, i2c_timeoutB);
+    HAL_Delay(12);
+    if ((readData & 0x01) == 0x01) // check Data ready (DRDY is 1)
+    {
+        // Read Mag data
+        uint8_t rawMagData[7];
+        HAL_I2C_Mem_Read(&hi2c1, AK8963_ADDRESS, AK8963_XOUT_L, 1, &rawMagData[0], 7, i2c_timeoutB);
+        uint8_t c = rawMagData[6]; // ST2
+
+        if (!(c & 0x08)) // check whether the magnetic sensor is overflown (ST2)
+        {
+            MagX = (rawMagData[1] << 8) | rawMagData[0];
+            MagY = (rawMagData[3] << 8) | rawMagData[2];
+            MagZ = (rawMagData[5] << 8) | rawMagData[4];
+
+            // Ellipsoid Fit
+            MagX = MagX - (-143.22);
+            MagY = (MagY - (-17.815)) * 243.21 / 236.71;
+            MagZ = (MagZ - (-25.165)) * 243.21 / 223.45;
+
+            // Print to Com port via STLINK
+            mpu9250.mag.x = (float)MagY * ASA[1] * (4912.0 / 32760.0);  // ASA[1] = ASAY(4912.0 / 32760.0)
+            mpu9250.mag.y = (float)MagX * ASA[0] * (4912.0 / 32760.0);  // ASA[0] = ASAX
+            mpu9250.mag.z = (float)-MagZ * ASA[2] * (4912.0 / 32760.0); // ASA[2] = ASAZ
+
+            if (print_flag == 3 || print_flag == 4)
+            {
+                printf("Magnetometer(Direction Corrected) :\r\n");
+                printf("data MX: %d\r\n", MagY);
+                printf("Mag X: %.4f µT\r\n", mpu9250.mag.x);
+                printf("data MY: %d\r\n", MagX);
+                printf("Mag Y: %.4f µT\r\n", mpu9250.mag.y);
+                printf("data MZ: %d\r\n", -MagZ);
+                printf("Mag Z: %.4f µT\r\n\n", mpu9250.mag.z);
+                printf("------------------------------------------------\r\n");
+            }
+
+            // mag_count = 0; // magnetometer can't read too often , 2rd method
+            HAL_Delay(20); // at 100 Hz ODR, new mag data is available every 10 ms
+        }
+    }
+    else
+    {
+        printf("No Data? \r\n");
+        printf("------------------------------------------------\r\n");
+    }
+}
+void imuUpdate() // use MahonyAHRS
+{
+    // Auxiliary variables to avoid repeated arithmetic
+    float q0q0 = q0 * q0;
+    float q1q1 = q1 * q1;
+    float q2q2 = q2 * q2;
+    float q3q3 = q3 * q3;
+
+    float q0q1 = q0 * q1;
+    float q0q2 = q0 * q2;
+    float q0q3 = q0 * q3;
+    float q1q2 = q1 * q2;
+    float q1q3 = q1 * q3;
+    float q2q3 = q2 * q3;
+
+    float normalise;
+    float ex, ey, ez;
+    float halfT;
+    float hx, hy, hz, bx, bz;
+    float vx, vy, vz, wx, wy, wz;
+
+    now_update = HAL_GetTick(); // unit : ms
+    halfT = ((float)(now_update - last_update) / 2000.0f);
+    last_update = now_update;
+
+    // Normalise accelerometer measurement
+    if (mpu9250.acc.x != 0 || mpu9250.acc.y != 0 || mpu9250.acc.z != 0)
+    {
+        normalise = sqrt(mpu9250.acc.x * mpu9250.acc.x + mpu9250.acc.y * mpu9250.acc.y + mpu9250.acc.z * mpu9250.acc.z);
+        mpu9250.acc.x /= normalise;
+        mpu9250.acc.y /= normalise;
+        mpu9250.acc.z /= normalise;
+    }
+
+    // Normalise magnetometer measurement
+    if (mpu9250.mag.x != 0 || mpu9250.mag.y != 0 || mpu9250.mag.z != 0)
+    {
+        normalise = sqrt(mpu9250.mag.x * mpu9250.mag.x + mpu9250.mag.y * mpu9250.mag.y + mpu9250.mag.z * mpu9250.mag.z);
+        mpu9250.mag.x /= normalise;
+        mpu9250.mag.y /= normalise;
+        mpu9250.mag.z /= normalise;
+    }
+
+    /* 計算磁力計投影到物體座標上的各個分量 */
+    hx = 2.0f * (mpu9250.mag.x * (0.5f - q2q2 - q3q3) + mpu9250.mag.y * (q1q2 - q0q3) + mpu9250.mag.z * (q1q3 + q0q2));
+    hy = 2.0f * (mpu9250.mag.x * (q1q2 + q0q3) + mpu9250.mag.y * (0.5f - q1q1 - q3q3) + mpu9250.mag.z * (q2q3 - q0q1));
+    hz = 2.0f * (mpu9250.mag.x * (q1q3 - q0q2) + mpu9250.mag.y * (q2q3 + q0q1) + mpu9250.mag.z * (0.5f - q1q1 - q2q2));
+    bx = sqrt((hx * hx) + (hy * hy));
+    bz = hz;
+
+    /* 計算加速度計投影到物體座標上的各個分量*/
+    vx = 2.0f * (q1q3 - q0q2);
+    vy = 2.0f * (q0q1 + q2q3);
+    vz = q0q0 - q1q1 - q2q2 + q3q3;
+
+    /* 處理過後的磁力計新分量 */
+    wx = 2.0f * (bx * (0.5f - q2q2 - q3q3) + bz * (q1q3 - q0q2));
+    wy = 2.0f * (bx * (q1q2 - q0q3) + bz * (q0q1 + q2q3));
+    wz = 2.0f * (bx * (q0q2 + q1q3) + bz * (0.5f - q1q1 - q2q2));
+
+    /* 差積誤差累計，用以修正陀螺儀 */
+    ex = (mpu9250.acc.y * vz - mpu9250.acc.z * vy) + (mpu9250.mag.y * wz - mpu9250.mag.z * wy);
+    ey = (mpu9250.acc.z * vx - mpu9250.acc.x * vz) + (mpu9250.mag.z * wx - mpu9250.mag.x * wz);
+    ez = (mpu9250.acc.x * vy - mpu9250.acc.y * vx) + (mpu9250.mag.x * wy - mpu9250.mag.y * wx);
+
+    /* 互補濾波 PI */
+    exInt += ex * Ki * halfT;
+    eyInt += ey * Ki * halfT;
+    ezInt += ez * Ki * halfT;
+    mpu9250.gyro.x += Kp * ex + exInt;
+    mpu9250.gyro.y += Kp * ey + eyInt;
+    mpu9250.gyro.z += Kp * ez + ezInt;
+
+    /* 使用 一階龍格-庫塔 更新四元數 */
+    q0 += (-q1 * mpu9250.gyro.x - q2 * mpu9250.gyro.y - q3 * mpu9250.gyro.z) * halfT;
+    q1 += (q0 * mpu9250.gyro.x + q2 * mpu9250.gyro.z - q3 * mpu9250.gyro.y) * halfT;
+    q2 += (q0 * mpu9250.gyro.y - q1 * mpu9250.gyro.z + q3 * mpu9250.gyro.x) * halfT;
+    q3 += (q0 * mpu9250.gyro.z + q1 * mpu9250.gyro.y - q2 * mpu9250.gyro.x) * halfT;
+
+    // Normalise quaternion
+    normalise = sqrt(q0 * q0 + q1 * q1 + q2 * q2 + q3 * q3);
+    q0 /= normalise;
+    q1 /= normalise;
+    q2 /= normalise;
+    q3 /= normalise;
+
+    /* 四元數 -> 歐拉角 */
+    mpu9250.attitude.x = -asinf(-2 * q1 * q3 + 2 * q0 * q2) * RAD2DEG;                                // pitch
+    mpu9250.attitude.y = atan2f(2 * q2 * q3 + 2 * q0 * q1, -2 * q1 * q1 - 2 * q2 * q2 + 1) * RAD2DEG; // roll
+    mpu9250.attitude.z = atan2f(2 * q1 * q2 + 2 * q0 * q3, -2 * q2 * q2 - 2 * q3 * q3 + 1) * RAD2DEG; // yaw
+
+    yaw = mpu9250.attitude.z;
+    pitch = mpu9250.attitude.x;
+    roll = mpu9250.attitude.y;
+
+    printf("yaw: %d \r\n", yaw);
+    printf("pitch: %d \r\n", pitch);
+    printf("roll: %d \r\n\n", roll);
+    printf("---------------------------------\n");
 }
 /* USER CODE END 4 */
 
