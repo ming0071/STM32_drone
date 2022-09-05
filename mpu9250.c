@@ -523,8 +523,8 @@ void GetMagBiasData()
 }
 void GetIMUData(float ASA[3])
 {
-#define print_flag 0 // 0-> no work , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
-                     //             , 4 ->printf all data
+#define print_flag 0 // 0-> no printf , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
+                     //               , 4 ->printf all data
 
     static short mag_count = 0;
     // Read ACCEL----------------------------------------------------------------------------------
