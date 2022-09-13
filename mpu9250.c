@@ -385,7 +385,7 @@ void MPU9250_Init(float ASA[3])
     printf("ACCEL meansure range : %d\r\n", readData);
 
     // GYRO
-    pdata = 01 << 3; // Gyro Full Scale Select +500dps (01)
+    pdata = 01 << 3; // Gyro Full Scale Select ±500dps (01)
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, GYRO_CONFIG, 1, &pdata, 1, i2c_timeoutB);
     HAL_I2C_Mem_Read(&hi2c1, MPU9250_ADDRESS, GYRO_CONFIG, 1, &readData, 1, i2c_timeoutB);
     printf("GYRO meansure range : %d\r\n", readData);
@@ -410,7 +410,7 @@ void MPU9250_Init(float ASA[3])
     pdata = 0;
     HAL_I2C_Mem_Write(&hi2c1, MPU9250_ADDRESS, PWR_MGMT_2, 1, &pdata, 1, HAL_MAX_DELAY);
 
-    // Mag
+    // Mag---------------------------------------------------------------------------------
     // Power down magnetometer
     writeData = 0x00;
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
@@ -521,7 +521,7 @@ void GetMagBiasData()
         printf("------------------------------------------------\r\n");
     }
 }
-void GetIMUData(float ASA[3])
+void GetIMUData(float ASA[3])   
 {
 #define print_flag 0 // 0-> no printf , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
                      //               , 4 ->printf all data
