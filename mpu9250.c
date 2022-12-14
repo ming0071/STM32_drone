@@ -22,7 +22,9 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
+#include <time.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -96,20 +98,21 @@ short MagX;
 short MagY;
 short MagZ;
 
-float Kp = 2.0f; /*比例增益*/
-float Ki = 0.1f; /*积分增益*/
+float Kp = 2.0f; /*比�?��?��??*/
+float Ki = 0.1f; /*积�?��?��??*/
 float exInt = 0.0f;
 float eyInt = 0.0f;
-float ezInt = 0.0f; /*积分误差累计*/
+float ezInt = 0.0f; /*积�?�误差累�???????????*/
 
-static float q0 = 1.0f; /*四元数*/
+static float q0 = 1.0f; /*??��?�数*/
 static float q1 = 0.0f;
 static float q2 = 0.0f;
 static float q3 = 0.0f;
 volatile uint32_t last_update, now_update;
-int yaw;
-int pitch;
-int roll;
+float yaw;
+float ref_yaw = 0.0f;
+float pitch;
+float roll;
 
 float ASA[3] = {0}; // ASA[0] = ASAX , ASA[1] = ASAY , ASA[2] = ASAZ
 
@@ -126,9 +129,31 @@ struct MPU9250_t
     struct Axisf mag;
     struct Axisf attitude;
 };
-extern struct MPU9250_t mpu9250;
 struct MPU9250_t mpu9250;
 
+// Motor Controll Variables
+struct PID
+{
+    float Kp;
+    float Ki;
+    float Kd;
+    float pid;
+    float pre_error;
+    float prev_degree;
+};
+struct Euler_angle
+{
+    struct PID ro11;
+    struct PID pitch;
+    struct PID yaw;
+};
+struct Euler_angle euler;
+
+float error, pre_error = 0.0f;
+float Pterm, Iterm, Dterm = 0.0f;
+float motor_1, motor_2, motor_3, motor_4 = 0.0f;
+float I_add = 0.0f, I_max = 20.0f, I_min = -20.0f;
+float throttle = 1410.0f;
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -139,6 +164,10 @@ struct MPU9250_t mpu9250;
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c1;
 
+TIM_HandleTypeDef htim1;
+DMA_HandleTypeDef hdma_tim1_ch1;
+DMA_HandleTypeDef hdma_tim1_ch2;
+
 /* USER CODE BEGIN PV */
 
 const uint16_t i2c_timeoutB = 100;
@@ -148,18 +177,19 @@ const uint16_t i2c_timeoutB = 100;
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
-
-// myset
-void MPU9250_Init(float ASA[3]);
+static void MX_TIM1_Init(void);
+/* USER CODE BEGIN PFP */
+void MPU9250_Init();
 void GetGyroBiasData();
 void GetAccBiasData();
 void GetMagBiasData();
-void GetIMUData(float ASA[3]);
-void imuUpdate();
-
-/* USER CODE BEGIN PFP */
-
+void GetIMUData();
+void GetEulerAngle();
+void ESCcalibration();
+float PID(float ref, float degree, float *pre_error, float *prev_degree, float kp, float ki, float kd);
+float motor_limit(float motor, int upper, int lower);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
@@ -168,10 +198,8 @@ void imuUpdate();
 __attribute__((weak)) int _write(int file, char *ptr, int len)
 {
     int DataIdx;
-
     for (DataIdx = 0; DataIdx < len; DataIdx++)
     {
-        //__io_putchar(*ptr++);
         ITM_SendChar(*ptr++);
     }
     return len;
@@ -207,11 +235,36 @@ int main(void)
 
     /* Initialize all configured peripherals */
     MX_GPIO_Init();
+    MX_DMA_Init();
     MX_I2C1_Init();
+    MX_TIM1_Init();
     /* USER CODE BEGIN 2 */
-    // initial set
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_2);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_3);
+    HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_4);
+    MPU9250_Init();
 
-    MPU9250_Init(ASA);
+    // roll
+    euler.ro11.Kp = 0.56; // no setting sampling time
+    euler.ro11.Ki = 0.00005;
+    euler.ro11.Kd = 12.4;
+    euler.ro11.pre_error = 0;
+    // pitch
+    euler.pitch.Kp = 0.56; // no setting sampling time
+    euler.pitch.Ki = 0.00005;
+    euler.pitch.Kd = 12.4;
+    euler.pitch.pre_error = 0;
+    // yaw
+    euler.yaw.Kp = 0.8;
+    euler.yaw.Ki = 0.12;
+    euler.yaw.Kd = 4.8;
+    euler.yaw.pre_error = 0;
+    // order
+    short stateD1, stateD2, stateD3 = 0;
+    short cmpD2, cmpD3 = 0;
+
+    HAL_Delay(5000); // wait 10s start
     /* USER CODE END 2 */
 
     /* Infinite loop */
@@ -219,14 +272,69 @@ int main(void)
     while (1)
     {
         /* USER CODE END WHILE */
+
         /* USER CODE BEGIN 3 */
 
         // GetGyroBiasData();
         // GetAccBiasData();
         // GetMagBiasData();
-        GetIMUData(ASA);
-        imuUpdate();
-        HAL_Delay(20);
+        GetIMUData();
+        GetEulerAngle();
+
+        // ESCcalibration();
+        stateD1 = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_2);
+        stateD2 = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_3);
+        stateD3 = HAL_GPIO_ReadPin(GPIOE, GPIO_PIN_4);
+
+        if (stateD1 == 0)
+        {
+            motor_1 = 1000;
+            motor_2 = 1000;
+            motor_3 = 1000;
+            motor_4 = 1000;
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, motor_1); // PE9  	(V)
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, motor_2); // PE11	(V)
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, motor_3); // PE13
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, motor_4); // PE14
+            printf("motor1: %f \r\n", motor_1);
+            printf("motor2: %f \r\n", motor_2);
+            printf("motor3: %f \r\n", motor_3);
+            printf("motor4: %f \r\n", motor_4);
+            printf("D1: %d\r\n", stateD1);
+            ref_yaw = yaw;
+            printf("ref of yaw: %f\r\n", ref_yaw);
+        }
+        // PID_roll
+        else if (stateD1 == 1)
+        {
+            euler.ro11.pid = PID(0.0f, roll, &euler.ro11.pre_error, &euler.ro11.prev_degree, euler.ro11.Kp, euler.ro11.Ki, euler.ro11.Kd);
+            printf("Dterm: %f \r\n", Dterm);
+            euler.pitch.pid = PID(0.0f, pitch, &euler.pitch.pre_error, &euler.pitch.prev_degree, euler.pitch.Kp, euler.pitch.Ki, euler.pitch.Kd);
+            euler.yaw.pid = PID(ref_yaw, yaw, &euler.yaw.pre_error, &euler.yaw.prev_degree, euler.yaw.Kp, euler.yaw.Ki, euler.yaw.Kd);
+            motor_1 = throttle - euler.ro11.pid + euler.yaw.pid + 12; // TODO: + or -
+            motor_2 = throttle + euler.ro11.pid + euler.yaw.pid;      // TODO: + or -
+            motor_3 = throttle + euler.pitch.pid - euler.yaw.pid;     // TODO: + or -
+            motor_4 = throttle - euler.pitch.pid - euler.yaw.pid;     // TODO: + or -
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, motor_1);    // PE9
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, motor_2);    // PE11
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, motor_3);    // PE13
+            __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, motor_4);    // PE14
+            printf("motor1: %f \r\n", motor_1);
+            printf("motor2: %f \r\n", motor_2);
+            printf("motor3: %f \r\n", motor_3);
+            printf("motor4: %f \r\n", motor_4);
+            printf("roll.pid: %f\r\n", euler.ro11.pid);
+            if (cmpD2 != stateD2) // 110
+            {
+                throttle = throttle + 10;
+            }
+            if (cmpD3 != stateD3) // 101
+            {
+                throttle = throttle - 10;
+            }
+            cmpD2 = stateD2;
+            cmpD3 = stateD3;
+        }
     }
     /* USER CODE END 3 */
 }
@@ -309,6 +417,100 @@ static void MX_I2C1_Init(void)
 }
 
 /**
+ * @brief TIM1 Initialization Function
+ * @param None
+ * @retval None
+ */
+static void MX_TIM1_Init(void)
+{
+
+    /* USER CODE BEGIN TIM1_Init 0 */
+
+    /* USER CODE END TIM1_Init 0 */
+
+    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    TIM_OC_InitTypeDef sConfigOC = {0};
+    TIM_BreakDeadTimeConfigTypeDef sBreakDeadTimeConfig = {0};
+
+    /* USER CODE BEGIN TIM1_Init 1 */
+
+    /* USER CODE END TIM1_Init 1 */
+    htim1.Instance = TIM1;
+    htim1.Init.Prescaler = 168 - 1;
+    htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
+    htim1.Init.Period = 20000 - 1;
+    htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+    htim1.Init.RepetitionCounter = 0;
+    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+    if (HAL_TIMEx_MasterConfigSynchronization(&htim1, &sMasterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sConfigOC.OCMode = TIM_OCMODE_PWM1;
+    sConfigOC.Pulse = 0;
+    sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+    sConfigOC.OCNPolarity = TIM_OCNPOLARITY_HIGH;
+    sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+    sConfigOC.OCIdleState = TIM_OCIDLESTATE_RESET;
+    sConfigOC.OCNIdleState = TIM_OCNIDLESTATE_RESET;
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_3) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    if (HAL_TIM_PWM_ConfigChannel(&htim1, &sConfigOC, TIM_CHANNEL_4) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    sBreakDeadTimeConfig.OffStateRunMode = TIM_OSSR_DISABLE;
+    sBreakDeadTimeConfig.OffStateIDLEMode = TIM_OSSI_DISABLE;
+    sBreakDeadTimeConfig.LockLevel = TIM_LOCKLEVEL_OFF;
+    sBreakDeadTimeConfig.DeadTime = 0;
+    sBreakDeadTimeConfig.BreakState = TIM_BREAK_DISABLE;
+    sBreakDeadTimeConfig.BreakPolarity = TIM_BREAKPOLARITY_HIGH;
+    sBreakDeadTimeConfig.AutomaticOutput = TIM_AUTOMATICOUTPUT_DISABLE;
+    if (HAL_TIMEx_ConfigBreakDeadTime(&htim1, &sBreakDeadTimeConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+    /* USER CODE BEGIN TIM1_Init 2 */
+
+    /* USER CODE END TIM1_Init 2 */
+    HAL_TIM_MspPostInit(&htim1);
+}
+
+/**
+ * Enable DMA controller clock
+ */
+static void MX_DMA_Init(void)
+{
+
+    /* DMA controller clock enable */
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    /* DMA interrupt init */
+    /* DMA2_Stream1_IRQn interrupt configuration */
+    HAL_NVIC_SetPriority(DMA2_Stream1_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream1_IRQn);
+    /* DMA2_Stream2_IRQn interrupt configuration */
+    HAL_NVIC_SetPriority(DMA2_Stream2_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream2_IRQn);
+}
+
+/**
  * @brief GPIO Initialization Function
  * @param None
  * @retval None
@@ -324,18 +526,30 @@ static void MX_GPIO_Init(void)
     __HAL_RCC_GPIOB_CLK_ENABLE();
 
     /*Configure GPIO pin Output Level */
-    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_5, GPIO_PIN_RESET);
+    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET);
 
-    /*Configure GPIO pin : PE5 */
-    GPIO_InitStruct.Pin = GPIO_PIN_5;
+    /*Configure GPIO pins : PE2 PE3 PE4 */
+    GPIO_InitStruct.Pin = GPIO_PIN_2 | GPIO_PIN_3 | GPIO_PIN_4;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : PA0 */
+    GPIO_InitStruct.Pin = GPIO_PIN_0;
+    GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    /*Configure GPIO pin : PA1 */
+    GPIO_InitStruct.Pin = GPIO_PIN_1;
     GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
     GPIO_InitStruct.Pull = GPIO_NOPULL;
     GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-    HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
 /* USER CODE BEGIN 4 */
-void MPU9250_Init(float ASA[3])
+void MPU9250_Init()
 {
     uint8_t readData;
     uint8_t writeData;
@@ -439,7 +653,7 @@ void MPU9250_Init(float ASA[3])
     HAL_Delay(12);
 
     // Set magnetometer data resolution and sample ODR
-    // set the Magnetometer to continuous mode 2（100Hz) and 16-bit output
+    // set the Magnetometer to continuous mode 2�???????????100Hz) and 16-bit output
     writeData = 0x16;
     printf("writeData: %x\r\n", writeData);
     HAL_I2C_Mem_Write(&hi2c1, AK8963_ADDRESS, AK8963_CNTL1, 1, &writeData, 1, i2c_timeoutB);
@@ -521,10 +735,11 @@ void GetMagBiasData()
         printf("------------------------------------------------\r\n");
     }
 }
-void GetIMUData(float ASA[3])   
+void GetIMUData()
 {
-#define print_flag 0 // 0-> no printf , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
-                     //               , 4 ->printf all data
+#define print_flag 0    // 0-> no printf , 1 ->printf acc, 2 ->printf gyro , 3 ->printf mag
+                        //               , 4 ->printf all data
+#define position_flag 1 // 0 -> (-),1-> (+)
 
     static short mag_count = 0;
     // Read ACCEL----------------------------------------------------------------------------------
@@ -540,6 +755,14 @@ void GetIMUData(float ASA[3])
     mpu9250.acc.x = (float)ACCELX * tfa;
     mpu9250.acc.y = (float)ACCELY * tfa;
     mpu9250.acc.z = (float)ACCELZ * tfa;
+
+    // position
+    if (position_flag == 0)
+    {
+        mpu9250.acc.x *= (-1.0);
+        mpu9250.acc.y *= (-1.0);
+        mpu9250.acc.z *= (-1.0);
+    }
 
     if (print_flag == 1 || print_flag == 4)
     {
@@ -572,6 +795,14 @@ void GetIMUData(float ASA[3])
     mpu9250.gyro.x *= DEG2RAD;
     mpu9250.gyro.y *= DEG2RAD;
     mpu9250.gyro.z *= DEG2RAD;
+
+    // position
+    if (position_flag == 0)
+    {
+        mpu9250.gyro.x *= (-1.0);
+        mpu9250.gyro.y *= (-1.0);
+        mpu9250.gyro.z *= (-1.0);
+    }
 
     if (print_flag == 2 || print_flag == 4)
     {
@@ -614,6 +845,13 @@ void GetIMUData(float ASA[3])
             mpu9250.mag.y = (float)MagX * ASA[0] * (4912.0 / 32760.0);  // ASA[0] = ASAX
             mpu9250.mag.z = (float)-MagZ * ASA[2] * (4912.0 / 32760.0); // ASA[2] = ASAZ
 
+            // position
+            if (position_flag == 0)
+            {
+                mpu9250.mag.x *= (-1.0);
+                mpu9250.mag.y *= (-1.0);
+                mpu9250.mag.z *= (-1.0);
+            }
             if (print_flag == 3 || print_flag == 4)
             {
                 printf("Magnetometer(Direction Corrected) :\r\n");
@@ -636,7 +874,7 @@ void GetIMUData(float ASA[3])
         printf("------------------------------------------------\r\n");
     }
 }
-void imuUpdate() // use MahonyAHRS
+void GetEulerAngle() // use MahonyAHRS
 {
     // Auxiliary variables to avoid repeated arithmetic
     float q0q0 = q0 * q0;
@@ -731,10 +969,75 @@ void imuUpdate() // use MahonyAHRS
     pitch = mpu9250.attitude.x;
     roll = mpu9250.attitude.y;
 
-    printf("yaw: %d \r\n", yaw);
-    printf("pitch: %d \r\n", pitch);
-    printf("roll: %d \r\n\n", roll);
+    printf("yaw: %f \r\n", yaw);
+    printf("pitch: %f \r\n", pitch);
+    printf("roll: %f \r\n\n", roll);
     printf("---------------------------------\n");
+}
+void ESCcalibration()
+{
+    int state, pulse = 0;
+    state = HAL_GPIO_ReadPin(GPIOA, GPIO_PIN_0); // KEY_UP
+    if (state == 0)
+    {
+        pulse = 1000;
+        printf("%d already\r\n", pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse);
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_RESET); // LED0
+    }
+    HAL_Delay(50);
+    if (state == 1) // normal
+    {
+        HAL_GPIO_WritePin(GPIOA, GPIO_PIN_1, GPIO_PIN_SET); // LED0
+        pulse = 2000;
+        printf("%d already\r\n", pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_2, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_3, pulse);
+        __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_4, pulse);
+    }
+    HAL_Delay(50);
+}
+float PID(float ref, float degree, float *pre_error, float *prev_degree, float kp, float ki, float kd)
+{
+    float PID_value = 0;
+    error = ref - degree;
+    // Proportion
+    Pterm = kp * error;
+    // Integralc
+    I_add = 0.61 * I_add + error;
+    *prev_degree = degree;
+    Iterm = ki * I_add; // no setting sampling time
+    // Differential                     //no setting sampling time
+    Dterm = kd * (error - *pre_error); // called by address
+    *pre_error = error;
+    // Motor Power Calculate
+    PID_value = Pterm + Iterm + Dterm;
+
+    if (PID_value > 40)
+    {
+        PID_value = 40;
+    }
+    else if (PID_value < -40)
+    {
+        PID_value = -40;
+    }
+    return PID_value;
+}
+float motor_limit(float motor, int upper, int lower)
+{
+    if (motor > upper)
+    {
+        motor = upper;
+    }
+    else if (motor < lower)
+    {
+        motor = lower;
+    }
+    return motor;
 }
 /* USER CODE END 4 */
 
